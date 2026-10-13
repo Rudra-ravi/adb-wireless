@@ -1,0 +1,12 @@
+[Unit]
+Description=Auto-connect ADB to wireless debugging device
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/adb-wireless --auto
+RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target

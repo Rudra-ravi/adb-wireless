@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically retry ADB wireless auto-connect
+
+[Timer]
+OnBootSec=1m
+OnUnitActiveSec=5m
+Unit=adb-wireless.service
+
+[Install]
+WantedBy=timers.target

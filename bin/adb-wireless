@@ -1,0 +1,550 @@
+#!/usr/bin/env bash
+# adb-wireless: Unified dynamic Android Wireless Debugging detector & connector.
+# Zero hardcoded IPs, ports, interfaces, SSIDs, or device serials.
+set -euo pipefail
+
+source "${HOME}/.config/uwsm/env.d/20-user-path" 2>/dev/null || true
+
+LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/adb-wireless.lock"
+LOG_FILE="${XDG_CACHE_HOME:-${HOME}/.cache}/adb-wireless.log"
+mkdir -p "$(dirname "$LOG_FILE")"
+
+MODE="interactive"
+PAIR_CODE=""
+FORCE_RECONNECT=0
+
+usage() {
+  cat <<'EOF'
+Usage: adb-wireless [OPTIONS] [PAIRING_CODE]
+
+Unified dynamic Android Wireless Debugging detector & connector.
+Automatically discovers and connects to Wireless Debugging devices via:
+  1. mDNS active resolution (Avahi _adb-tls-connect._tcp & _adb-tls-pairing._tcp)
+  2. ADB native mDNS service discovery (adb mdns services)
+  3. USB-to-Wireless dynamic bootstrap (if a USB device is plugged in)
+  4. Dynamic LAN / Hotspot neighbor & ephemeral TLS port discovery (nmap fallback)
+
+Options:
+  -a, --auto         Quiet background mode (for systemd timer / dispatcher)
+  -p, --pair [CODE]  Pair device via 6-digit pairing code (auto-detects pairing port)
+  -q, --qr           Pair device via terminal QR code (zero typing required)
+  -u, --usb          Switch connected USB device to wireless TCP/IP dynamically
+  -r, --reconnect    Force disconnect existing wireless endpoints and reconnect
+  -d, --disconnect   Disconnect all wireless ADB endpoints
+  -s, --status       Show current ADB devices and discovered mDNS services
+  -h, --help         Show this help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -a|--auto)
+      MODE="auto"
+      shift
+      ;;
+    -p|--pair)
+      MODE="pair"
+      if [[ $# -gt 1 && "${2:-}" =~ ^[0-9]{6}$ ]]; then
+        PAIR_CODE="$2"
+        shift
+      fi
+      shift
+      ;;
+    -q|--qr)
+      MODE="qr"
+      shift
+      ;;
+    -u|--usb)
+      MODE="usb"
+      shift
+      ;;
+    -r|--reconnect)
+      FORCE_RECONNECT=1
+      shift
+      ;;
+    -d|--disconnect)
+      MODE="disconnect"
+      shift
+      ;;
+    -s|--status)
+      MODE="status"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      if [[ "$1" =~ ^[0-9]{6}$ ]]; then
+        MODE="pair"
+        PAIR_CODE="$1"
+        shift
+      else
+        echo "Unknown argument: $1" >&2
+        usage >&2
+        exit 1
+      fi
+      ;;
+  esac
+done
+
+log() {
+  printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$MODE" "$*" >> "$LOG_FILE"
+}
+
+info() {
+  log "$*"
+  if [[ "$MODE" != "auto" ]]; then
+    printf '==> %s\n' "$*"
+  fi
+}
+
+warn() {
+  log "WARN: $*"
+  if [[ "$MODE" != "auto" ]]; then
+    printf 'WARN: %s\n' "$*" >&2
+  fi
+}
+
+# Acquire non-blocking lock in auto mode, or wait up to 10s in interactive mode
+exec 9>"$LOCK_FILE"
+if [[ "$MODE" == "auto" ]]; then
+  flock -n 9 || exit 0
+else
+  flock -w 10 9 || { warn "Another adb-wireless instance is running."; exit 1; }
+fi
+
+ensure_adb_server() {
+  export ADB_MDNS_OPENSCREEN="${ADB_MDNS_OPENSCREEN:-1}"
+  export ADB_MDNS_AUTO_CONNECT="${ADB_MDNS_AUTO_CONNECT:-adb-tls-connect}"
+  adb start-server >/dev/null 2>&1 || true
+}
+
+# Prune offline or broken endpoints dynamically
+prune_stale_devices() {
+  local line serial state
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    serial=$(awk '{print $1}' <<<"$line")
+    state=$(awk '{print $2}' <<<"$line")
+    if [[ "$state" == "offline" || "$state" == "authorizing" ]]; then
+      if [[ "$serial" == *:* ]]; then
+        log "Pruning stale endpoint: $serial ($state)"
+        adb disconnect "$serial" >/dev/null 2>&1 || true
+      fi
+    fi
+  done < <(adb devices 2>/dev/null | tail -n +2)
+}
+
+# Check if any wireless or USB device is already online and responsive
+has_healthy_wireless_device() {
+  local serial
+  while IFS= read -r serial; do
+    [[ -z "$serial" ]] && continue
+    if timeout 2 adb -s "$serial" get-state >/dev/null 2>&1; then
+      return 0
+    else
+      adb disconnect "$serial" >/dev/null 2>&1 || true
+    fi
+  done < <(adb devices 2>/dev/null | awk 'NR > 1 && $2 == "device" && ($1 ~ /:/ || $1 ~ /_adb-tls-connect/) { print $1 }')
+  return 1
+}
+
+# Deduplicate redundant IP:PORT if mDNS transport for same device is also attached, or vice-versa
+dedupe_transports() {
+  # If the same physical device is connected twice (e.g., adb-<serial>._adb-tls-connect._tcp AND <ip>:<port>),
+  # keep the direct IP:PORT endpoint and disconnect the virtual service name so `adb` commands don't fail
+  # with "error: more than one device/emulator".
+  local ip_devs mdns_devs ip_dev mdns_dev ip_serial mdns_serial
+  mapfile -t ip_devs < <(adb devices 2>/dev/null | awk 'NR > 1 && $2 == "device" && $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$/ { print $1 }')
+  mapfile -t mdns_devs < <(adb devices 2>/dev/null | awk 'NR > 1 && $2 == "device" && $1 ~ /\._adb-tls-connect\._tcp/ { print $1 }')
+
+  if [[ ${#ip_devs[@]} -gt 0 && ${#mdns_devs[@]} -gt 0 ]]; then
+    for ip_dev in "${ip_devs[@]}"; do
+      ip_serial=$(timeout 2 adb -s "$ip_dev" get-serialno 2>/dev/null || true)
+      [[ -z "$ip_serial" ]] && continue
+      for mdns_dev in "${mdns_devs[@]}"; do
+        if [[ "$mdns_dev" == *"${ip_serial}"* ]]; then
+          # Disconnect the IP:PORT duplicate or wait: adb cannot `disconnect` mDNS auto-connect transport names,
+          # so disconnecting the duplicate IP:PORT leaves cleanly 1 transport! Or vice-versa if disconnect works.
+          if adb disconnect "$mdns_dev" >/dev/null 2>&1; then
+            log "Removed duplicate mDNS transport $mdns_dev"
+          else
+            adb disconnect "$ip_dev" >/dev/null 2>&1 || true
+            log "Removed duplicate IP transport $ip_dev (kept $mdns_dev)"
+          fi
+        fi
+      done
+    done
+  fi
+}
+
+# Try connecting to an IP:PORT endpoint and verify responsiveness
+try_connect_endpoint() {
+  local endpoint="$1"
+  [[ -z "$endpoint" ]] && return 1
+
+  # Already connected?
+  if adb devices 2>/dev/null | awk -v ep="$endpoint" 'NR > 1 && $1 == ep && $2 == "device" { found=1 } END { exit !found }'; then
+    if timeout 2 adb -s "$endpoint" get-state >/dev/null 2>&1; then
+      dedupe_transports
+      return 0
+    fi
+  fi
+
+  local out
+  out=$(timeout 4 adb connect "$endpoint" 2>&1 || true)
+  log "adb connect $endpoint -> $out"
+
+  if [[ "$out" == *"connected to"* ]]; then
+    if timeout 2 adb -s "$endpoint" get-state >/dev/null 2>&1; then
+      info "Connected to $endpoint"
+      dedupe_transports
+      return 0
+    fi
+    adb disconnect "$endpoint" >/dev/null 2>&1 || true
+  fi
+  return 1
+}
+
+# Discover mDNS services dynamically via Avahi (active + cache) and ADB native mDNS
+# Argument $1: service type (_adb-tls-connect._tcp or _adb-tls-pairing._tcp or _adb._tcp)
+discover_mdns_endpoints() {
+  local svc_type="$1"
+  local endpoints=()
+
+  # 1. Avahi active browse + cache resolution (IPv4)
+  if command -v avahi-browse >/dev/null 2>&1; then
+    while IFS= read -r ep; do
+      [[ -n "$ep" ]] && endpoints+=("$ep")
+    done < <(
+      {
+        timeout 3 avahi-browse -r -p -t "$svc_type" 2>/dev/null || true
+        timeout 2 avahi-browse -a -c -r -p 2>/dev/null | grep -F "$svc_type" || true
+      } | awk -F';' '$1 == "=" && $3 == "IPv4" && $8 ~ /^[0-9]+\./ && $9 ~ /^[0-9]+$/ { print $8 ":" $9 }' | sort -u
+    )
+  fi
+
+  # 2. ADB built-in mDNS service list
+  while IFS= read -r ep; do
+    [[ -n "$ep" ]] && endpoints+=("$ep")
+  done < <(
+    timeout 2 adb mdns services 2>/dev/null \
+      | awk -v st="$svc_type" '$0 ~ st && $3 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$/ { print $3 }' \
+      | sort -u
+  )
+
+  if [[ ${#endpoints[@]} -gt 0 ]]; then
+    printf '%s\n' "${endpoints[@]}" | sort -u
+  fi
+}
+
+# Dynamic pairing via 6-digit code
+do_pair_code() {
+  local code="${1:-}"
+  info "Searching for device in 'Pair device with pairing code' mode..."
+  local pair_endpoints=()
+  mapfile -t pair_endpoints < <(discover_mdns_endpoints "_adb-tls-pairing._tcp")
+
+  if [[ ${#pair_endpoints[@]} -eq 0 ]]; then
+    warn "No pairing service (_adb-tls-pairing._tcp) detected via mDNS."
+    if [[ "$MODE" != "auto" ]]; then
+      echo "On your phone: Settings -> Developer options -> Wireless debugging -> Pair device with pairing code"
+      read -r -p "Or enter pairing IP:PORT manually (leave blank to cancel): " manual_ep
+      if [[ -n "$manual_ep" ]]; then
+        pair_endpoints=("$manual_ep")
+      else
+        return 1
+      fi
+    else
+      return 1
+    fi
+  fi
+
+  local target="${pair_endpoints[0]}"
+  info "Found pairing endpoint: $target"
+
+  if [[ -z "$code" ]]; then
+    if [[ "$MODE" == "auto" ]]; then
+      log "Pairing endpoint $target found, but running in non-interactive auto mode."
+      return 1
+    fi
+    read -r -p "Enter 6-digit pairing code from phone: " code
+  fi
+
+  [[ -z "$code" ]] && return 1
+  info "Pairing with $target..."
+  if adb pair "$target" "$code"; then
+    info "Pairing succeeded."
+    sleep 1
+    return 0
+  else
+    warn "Pairing failed with $target."
+    return 1
+  fi
+}
+
+# Dynamic QR-code pairing (Android 11+ Wireless Debugging QR scanner)
+do_pair_qr() {
+  if ! command -v qrencode >/dev/null 2>&1; then
+    warn "qrencode is not installed. Use 'adb-wireless --pair' with a 6-digit code instead."
+    return 1
+  fi
+
+  local svc_name pass qr_payload
+  svc_name="adb-wireless-$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 8 || echo "host")"
+  pass="$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 12 || echo "pass12345678")"
+  qr_payload="WIFI:T:ADB;S:${svc_name};P:${pass};;"
+
+  echo ""
+  echo "Scan this QR code on your phone:"
+  echo "  Settings -> Developer options -> Wireless debugging -> Pair device with QR code"
+  echo ""
+  qrencode -t ansiutf8 "$qr_payload"
+  echo ""
+  info "Waiting up to 45s for phone to scan QR code..."
+
+  local i pair_ep
+  for i in $(seq 1 30); do
+    pair_ep=$(discover_mdns_endpoints "_adb-tls-pairing._tcp" | head -n 1 || true)
+    if [[ -n "$pair_ep" ]]; then
+      info "Detected pairing endpoint $pair_ep, completing handshake..."
+      if adb pair "$pair_ep" "$pass"; then
+        info "QR Pairing succeeded!"
+        sleep 1
+        connect_all_methods
+        return $?
+      fi
+    fi
+    sleep 1
+  done
+
+  warn "Timed out waiting for QR scan."
+  return 1
+}
+
+# Dynamic USB-to-Wireless bootstrap: no hardcoded IPs or device IDs
+bootstrap_from_usb() {
+  local usb_devs usb_serial dev_ip
+  mapfile -t usb_devs < <(adb devices 2>/dev/null | awk 'NR > 1 && $2 == "device" && $1 !~ /:/ && $1 !~ /\._adb/ { print $1 }')
+
+  [[ ${#usb_devs[@]} -eq 0 ]] && return 1
+
+  for usb_serial in "${usb_devs[@]}"; do
+    info "Found USB device: $usb_serial"
+    # Dynamically query the device's IPv4 address on wlan/ap/tether interfaces
+    dev_ip=$(timeout 3 adb -s "$usb_serial" shell ip -4 -o addr show 2>/dev/null \
+      | awk '$2 ~ /^(wlan|ap|swlan|rndis|eth)/ && $4 ~ /^[0-9]+\./ { sub(/\/.*/, "", $4); print $4; exit }' || true)
+
+    if [[ -z "$dev_ip" ]]; then
+      dev_ip=$(timeout 3 adb -s "$usb_serial" shell ip -4 route get 1.1.1.1 2>/dev/null \
+        | awk '{ for (i=1; i<=NF; i++) if ($i == "src") { print $(i+1); exit } }' || true)
+    fi
+
+    info "Enabling TCP/IP port 5555 on USB device $usb_serial..."
+    adb -s "$usb_serial" tcpip 5555 >/dev/null 2>&1 || continue
+    sleep 2
+
+    if [[ -n "$dev_ip" ]]; then
+      try_connect_endpoint "${dev_ip}:5555" && return 0
+    fi
+  done
+  return 1
+}
+
+# Dynamic LAN & Hotspot Discovery when mDNS multicast is isolated/blocked
+discover_via_lan_probe() {
+  command -v nmap >/dev/null 2>&1 || return 1
+
+  # Dynamically identify active physical LAN/Wi-Fi interfaces (exclude loopback, VPNs, tunnels, containers)
+  local active_ifaces=()
+  mapfile -t active_ifaces < <(
+    ip -4 -o addr show up scope global 2>/dev/null \
+      | awk '$2 !~ /^(lo|tun|tap|tailscale|wg|Cloudflare|docker|br-|veth|virbr|vmnet)/ { print $2 }' \
+      | sort -u
+  )
+
+  [[ ${#active_ifaces[@]} -eq 0 ]] && return 1
+
+  local iface gw subnet candidate_ips=()
+  for iface in "${active_ifaces[@]}"; do
+    # 1. Current ARP / neighbor cache on this interface (REACHABLE / STALE / DELAY)
+    while IFS= read -r ip; do
+      [[ -n "$ip" ]] && candidate_ips+=("$ip")
+    done < <(ip -4 neigh show dev "$iface" 2>/dev/null | awk '$1 ~ /^[0-9]+\./ && $NF !~ /FAILED/ { print $1 }')
+
+    # 2. Default gateway on this interface (crucial when laptop is tethered to phone Wi-Fi hotspot)
+    gw=$(ip -4 route show dev "$iface" default 2>/dev/null | awk '/default via/ { print $3; exit }')
+    if [[ -n "$gw" ]]; then
+      # If gateway is NOT a standard .1/.254 router, or if DHCP options / tether range indicate hotspot, prioritize it
+      candidate_ips+=("$gw")
+    fi
+
+    # 3. In interactive mode, if neighbor table has no other hosts, do a fast 1s subnet ping sweep to wake ARP
+    if [[ "$MODE" != "auto" && ${#candidate_ips[@]} -le 1 ]]; then
+      subnet=$(ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{ print $4; exit }')
+      if [[ -n "$subnet" ]]; then
+        info "Scanning subnet $subnet on $iface for active hosts..."
+        while IFS= read -r ip; do
+          [[ -n "$ip" ]] && candidate_ips+=("$ip")
+        done < <(nmap -sn -n -T5 --min-rate 1000 -oG - "$subnet" 2>/dev/null | awk '/Status: Up/ { print $2 }')
+      fi
+    fi
+  done
+
+  [[ ${#candidate_ips[@]} -eq 0 ]] && return 1
+
+  # Remove local host IPs and deduplicate while preserving discovery order
+  local local_ips=()
+  mapfile -t local_ips < <(ip -4 -o addr show 2>/dev/null | awk '{ sub(/\/.*/, "", $4); print $4 }')
+
+  local unique_ips=() ip skip l_ip
+  for ip in "${candidate_ips[@]}"; do
+    skip=0
+    for l_ip in "${local_ips[@]}" "${unique_ips[@]}"; do
+      if [[ "$ip" == "$l_ip" ]]; then
+        skip=1
+        break
+      fi
+    done
+    [[ $skip -eq 0 ]] && unique_ips+=("$ip")
+  done
+
+  [[ ${#unique_ips[@]} -eq 0 ]] && return 1
+
+  # Fast probe candidate IPs for ephemeral Android Wireless Debugging ports (30000-49999) + legacy 5555
+  info "Probing candidate host(s) (${unique_ips[*]}) for open Wireless Debugging ports..."
+  local host open_ports port
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    host=$(awk '{print $2}' <<<"$line")
+    open_ports=$(grep -oE '[0-9]+/open/tcp' <<<"$line" | cut -d/ -f1 || true)
+    for port in $open_ports; do
+      # Skip common non-ADB high ports if many ports are open, or test directly
+      try_connect_endpoint "${host}:${port}" && return 0
+    done
+  done < <(nmap -n -Pn -T5 --min-rate 5000 --max-retries 1 -p 30000-49999,5555 --open -oG - "${unique_ips[@]}" 2>/dev/null || true)
+
+  return 1
+}
+
+connect_all_methods() {
+  ensure_adb_server
+  prune_stale_devices
+
+  if [[ $FORCE_RECONNECT -eq 1 ]]; then
+    info "Disconnecting existing wireless connections..."
+    adb disconnect >/dev/null 2>&1 || true
+  elif has_healthy_wireless_device; then
+    dedupe_transports
+    if [[ "$MODE" != "auto" ]]; then
+      info "Wireless ADB device already connected:"
+      adb devices -l
+    fi
+    return 0
+  fi
+
+  # Tier 1: mDNS discovery (_adb-tls-connect._tcp and _adb._tcp)
+  info "Searching for wireless ADB devices via mDNS..."
+  local endpoints=() ep
+  mapfile -t endpoints < <(
+    discover_mdns_endpoints "_adb-tls-connect._tcp"
+    discover_mdns_endpoints "_adb._tcp"
+  )
+
+  for ep in "${endpoints[@]}"; do
+    [[ -z "$ep" ]] && continue
+    if try_connect_endpoint "$ep"; then
+      [[ "$MODE" != "auto" ]] && adb devices -l
+      return 0
+    fi
+  done
+
+  # Tier 2: Check if a device is advertising pairing mode (_adb-tls-pairing._tcp) in interactive mode
+  if [[ "$MODE" == "interactive" ]]; then
+    local pair_eps=()
+    mapfile -t pair_eps < <(discover_mdns_endpoints "_adb-tls-pairing._tcp")
+    if [[ ${#pair_eps[@]} -gt 0 ]]; then
+      info "Device detected in Pairing Mode (${pair_eps[0]})."
+      if do_pair_code ""; then
+        mapfile -t endpoints < <(discover_mdns_endpoints "_adb-tls-connect._tcp")
+        for ep in "${endpoints[@]}"; do
+          if try_connect_endpoint "$ep"; then
+            adb devices -l
+            return 0
+          fi
+        done
+      fi
+    fi
+  fi
+
+  # Tier 3: USB-to-Wireless automatic bootstrap (if phone is plugged in via USB)
+  if bootstrap_from_usb; then
+    [[ "$MODE" != "auto" ]] && adb devices -l
+    return 0
+  fi
+
+  # Tier 4: Dynamic LAN / Hotspot port probe (when mDNS is dropped by router or phone hotspot)
+  if discover_via_lan_probe; then
+    [[ "$MODE" != "auto" ]] && adb devices -l
+    return 0
+  fi
+
+  if [[ "$MODE" != "auto" ]]; then
+    warn "No wireless ADB device found."
+    cat <<'EOF' >&2
+Ensure on your phone:
+  1. Settings -> Developer options -> Wireless debugging -> ON
+  2. Phone and PC are on the same Wi-Fi network (or phone hotspot)
+  3. If never paired with this PC, run:
+       adb-wireless --pair      (6-digit pairing code)
+       adb-wireless --qr        (scan QR code from terminal)
+EOF
+  fi
+  return 1
+}
+
+case "$MODE" in
+  disconnect)
+    ensure_adb_server
+    adb disconnect
+    adb devices -l
+    ;;
+  status)
+    ensure_adb_server
+    prune_stale_devices
+    dedupe_transports
+    echo "=== Connected ADB Devices ==="
+    adb devices -l
+    echo ""
+    echo "=== Discovered mDNS Connect Endpoints ==="
+    discover_mdns_endpoints "_adb-tls-connect._tcp" || true
+    echo ""
+    echo "=== Discovered mDNS Pairing Endpoints ==="
+    discover_mdns_endpoints "_adb-tls-pairing._tcp" || true
+    ;;
+  pair)
+    ensure_adb_server
+    if do_pair_code "$PAIR_CODE"; then
+      connect_all_methods
+    else
+      exit 1
+    fi
+    ;;
+  qr)
+    ensure_adb_server
+    do_pair_qr
+    ;;
+  usb)
+    ensure_adb_server
+    if bootstrap_from_usb; then
+      adb devices -l
+    else
+      warn "No USB Android device found to switch to wireless mode."
+      exit 1
+    fi
+    ;;
+  auto|interactive)
+    connect_all_methods
+    ;;
+esac
